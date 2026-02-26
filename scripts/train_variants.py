@@ -1,0 +1,642 @@
+#!/usr/bin/env python3
+"""
+Step 3: Train 4 detector variants with different hard negative mixing strategies.
+
+Variants:
+  V1: Hard only — replace all negatives with hard negatives (Method A+B)
+  V2: 50/50 — 50% hard, 50% original easy negatives
+  V3: 75/25 — 75% hard, 25% easy
+  V4: Curriculum — easy negatives first (10 epochs), then hard negatives
+"""
+import os
+import sys
+import json
+import time
+import numpy as np
+from copy import deepcopy
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import roc_auc_score, precision_recall_curve
+
+# ── Paths ────────────────────────────────────────────────────────────────
+EXISTING_DATA = os.path.expanduser('~/bsl_project/improved_detection/data/rich_25f.npz')
+HARD_NEG_DIR = os.path.expanduser('~/bsl_project/hard_negative_detection/hard_negatives/')
+MODEL_DIR = os.path.expanduser('~/bsl_project/hard_negative_detection/models/')
+LOG_DIR = os.path.join(MODEL_DIR, 'training_logs/')
+os.makedirs(MODEL_DIR, exist_ok=True)
+os.makedirs(LOG_DIR, exist_ok=True)
+
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+SEED = 42
+INPUT_DIM = 158
+WINDOW_SIZE = 25
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# MODEL (same as improved_detection/scripts/train_models.py)
+# ══════════════════════════════════════════════════════════════════════════
+
+class CNN1D(nn.Module):
+    def __init__(self, input_dim, hidden_dim=128):
+        super().__init__()
+        self.conv1 = nn.Conv1d(input_dim, hidden_dim, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm1d(hidden_dim)
+        self.conv2 = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm1d(hidden_dim)
+        self.conv3 = nn.Conv1d(hidden_dim, hidden_dim // 2, kernel_size=3, padding=1)
+        self.bn3 = nn.BatchNorm1d(hidden_dim // 2)
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.fc = nn.Linear(hidden_dim // 2, 1)
+        self.dropout = nn.Dropout(0.3)
+
+    def forward(self, x):
+        x = x.transpose(1, 2)
+        x = torch.relu(self.bn1(self.conv1(x)))
+        x = torch.relu(self.bn2(self.conv2(x)))
+        x = self.dropout(x)
+        x = torch.relu(self.bn3(self.conv3(x)))
+        x = self.pool(x).squeeze(-1)
+        return self.fc(x).squeeze(-1)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# TRAINING
+# ══════════════════════════════════════════════════════════════════════════
+
+def train_model(model, train_X, train_y, val_X, val_y,
+                epochs=50, batch_size=128, lr=1e-3, patience=7):
+    """Train with early stopping on AUROC. Returns model, scaler, results.
+
+    WARNING: This function modifies train_X and val_X in-place (scaling) to save memory.
+    """
+    import gc
+    model = model.to(DEVICE)
+
+    feat_dim = train_X.shape[2]
+    scaler = StandardScaler()
+    # Fit scaler on a subsample (50K windows is statistically sufficient)
+    n_fit = min(50000, len(train_X))
+    fit_idx = np.random.choice(len(train_X), size=n_fit, replace=False)
+    scaler.fit(train_X[fit_idx].reshape(-1, feat_dim))
+    del fit_idx
+
+    # Scale in-place (caller's array is modified — saves ~8GB per variant)
+    train_flat = train_X.reshape(-1, feat_dim)
+    train_flat -= scaler.mean_
+    train_flat /= (scaler.scale_ + 1e-8)
+
+    val_flat = val_X.reshape(-1, feat_dim)
+    val_flat -= scaler.mean_
+    val_flat /= (scaler.scale_ + 1e-8)
+
+    # Use from_numpy to avoid copy (tensors share memory with numpy arrays)
+    train_ds = TensorDataset(torch.from_numpy(train_X), torch.from_numpy(train_y.astype(np.float32)))
+    val_ds = TensorDataset(torch.from_numpy(val_X), torch.from_numpy(val_y.astype(np.float32)))
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
+                              num_workers=0, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
+                            num_workers=0, pin_memory=True)
+
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, factor=0.5, mode='max')
+
+    best_auroc = 0
+    best_state = None
+    no_improve = 0
+    history = []
+
+    for epoch in range(epochs):
+        model.train()
+        train_loss = 0
+        for X_batch, y_batch in train_loader:
+            X_batch, y_batch = X_batch.to(DEVICE), y_batch.to(DEVICE)
+            optimizer.zero_grad()
+            logits = model(X_batch)
+            loss = criterion(logits, y_batch)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+        train_loss /= len(train_loader)
+
+        model.eval()
+        all_probs, all_labels = [], []
+        with torch.no_grad():
+            for X_batch, y_batch in val_loader:
+                X_batch = X_batch.to(DEVICE)
+                logits = model(X_batch)
+                probs = torch.sigmoid(logits).cpu().numpy()
+                all_probs.extend(probs)
+                all_labels.extend(y_batch.numpy())
+
+        all_probs = np.array(all_probs)
+        all_labels = np.array(all_labels)
+        auroc = roc_auc_score(all_labels, all_probs)
+
+        precisions, recalls, thresholds = precision_recall_curve(all_labels, all_probs)
+        f1s = 2 * precisions * recalls / (precisions + recalls + 1e-8)
+        best_f1_idx = np.argmax(f1s)
+        best_f1 = f1s[best_f1_idx]
+        best_thresh = thresholds[best_f1_idx] if best_f1_idx < len(thresholds) else 0.5
+
+        scheduler.step(auroc)
+
+        history.append({
+            'epoch': epoch + 1,
+            'train_loss': float(train_loss),
+            'auroc': float(auroc),
+            'best_f1': float(best_f1),
+            'best_thresh': float(best_thresh),
+            'lr': float(optimizer.param_groups[0]['lr']),
+        })
+
+        if auroc > best_auroc:
+            best_auroc = auroc
+            best_state = deepcopy(model.state_dict())
+            best_f1_final = best_f1
+            best_thresh_final = best_thresh
+            no_improve = 0
+        else:
+            no_improve += 1
+
+        if (epoch + 1) % 5 == 0 or epoch == 0 or no_improve == 0:
+            print(f"    Epoch {epoch+1:3d}: loss={train_loss:.4f} AUROC={auroc:.4f} "
+                  f"F1={best_f1:.4f}@{best_thresh:.3f} {'*' if no_improve==0 else ''}")
+
+        if no_improve >= patience:
+            print(f"    Early stopping at epoch {epoch+1}")
+            break
+
+    model.load_state_dict(best_state)
+    model.eval()
+
+    return model, scaler, {
+        'best_auroc': float(best_auroc),
+        'best_f1': float(best_f1_final),
+        'best_threshold': float(best_thresh_final),
+        'epochs_trained': len(history),
+        'history': history,
+    }
+
+
+def train_curriculum(pos_train, easy_neg_train, hard_neg_train,
+                     pos_val, neg_val, phase1_epochs=10, phase2_epochs=40):
+    """Curriculum training: easy negatives first, then hard negatives."""
+    import gc
+    model = CNN1D(input_dim=INPUT_DIM).to(DEVICE)
+
+    # Phase 1: Easy negatives
+    print("    Phase 1: Easy negatives...")
+    n_pos = len(pos_train)
+    easy_neg = easy_neg_train[:n_pos] if len(easy_neg_train) >= n_pos else easy_neg_train
+
+    train_X1 = np.vstack([pos_train, easy_neg])
+    train_y1 = np.concatenate([np.ones(len(pos_train)), np.zeros(len(easy_neg))])
+
+    feat_dim = train_X1.shape[2]
+    scaler1 = StandardScaler()
+    n_fit = min(50000, len(train_X1))
+    scaler1.fit(train_X1[np.random.choice(len(train_X1), n_fit, replace=False)].reshape(-1, feat_dim))
+
+    # Scale in-place
+    flat1 = train_X1.reshape(-1, feat_dim)
+    flat1 -= scaler1.mean_
+    flat1 /= (scaler1.scale_ + 1e-8)
+
+    # Build val set
+    val_X = np.vstack([pos_val, neg_val])
+    val_y = np.concatenate([np.ones(len(pos_val)), np.zeros(len(neg_val))]).astype(np.float32)
+    flat_v = val_X.reshape(-1, feat_dim)
+    flat_v -= scaler1.mean_
+    flat_v /= (scaler1.scale_ + 1e-8)
+
+    train_y1 = train_y1.astype(np.float32)
+    train_ds = TensorDataset(torch.from_numpy(train_X1), torch.from_numpy(train_y1))
+    val_ds = TensorDataset(torch.from_numpy(val_X), torch.from_numpy(val_y))
+    del train_X1  # shared with tensor via from_numpy — but that's ok, tensor holds ref
+    gc.collect()
+    train_loader = DataLoader(train_ds, batch_size=128, shuffle=True, num_workers=0, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=128, shuffle=False, num_workers=0, pin_memory=True)
+
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
+
+    history = []
+    for epoch in range(phase1_epochs):
+        model.train()
+        train_loss = 0
+        for X_batch, y_batch in train_loader:
+            X_batch, y_batch = X_batch.to(DEVICE), y_batch.to(DEVICE)
+            optimizer.zero_grad()
+            loss = criterion(model(X_batch), y_batch)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+        train_loss /= len(train_loader)
+
+        model.eval()
+        all_probs = []
+        all_labels_v = []
+        with torch.no_grad():
+            for X_batch, y_batch in val_loader:
+                probs = torch.sigmoid(model(X_batch.to(DEVICE))).cpu().numpy()
+                all_probs.extend(probs)
+                all_labels_v.extend(y_batch.numpy())
+        auroc = roc_auc_score(np.array(all_labels_v), np.array(all_probs))
+        history.append({'epoch': epoch+1, 'phase': 1, 'train_loss': float(train_loss),
+                        'auroc': float(auroc)})
+        if (epoch+1) % 5 == 0 or epoch == 0:
+            print(f"    P1 Epoch {epoch+1:3d}: loss={train_loss:.4f} AUROC={auroc:.4f}")
+
+    # Free phase 1 data
+    del train_ds, val_ds, train_loader, val_loader
+    gc.collect()
+
+    # Phase 2: Hard negatives (keep model weights, switch data)
+    print("    Phase 2: Hard negatives...")
+    hard_neg = hard_neg_train[:n_pos] if len(hard_neg_train) >= n_pos else hard_neg_train
+    train_X2 = np.vstack([pos_train, hard_neg])
+    train_y2 = np.concatenate([np.ones(len(pos_train)), np.zeros(len(hard_neg))])
+
+    # New scaler for phase 2
+    scaler2 = StandardScaler()
+    n_fit2 = min(50000, len(train_X2))
+    scaler2.fit(train_X2[np.random.choice(len(train_X2), n_fit2, replace=False)].reshape(-1, feat_dim))
+
+    # Scale in-place
+    flat2 = train_X2.reshape(-1, feat_dim)
+    flat2 -= scaler2.mean_
+    flat2 /= (scaler2.scale_ + 1e-8)
+
+    # Re-scale val_X with scaler2 (it was scaled with scaler1, need to undo then redo)
+    # Easier to rebuild from scratch
+    val_X2 = np.vstack([pos_val, neg_val])
+    val_y2 = np.concatenate([np.ones(len(pos_val)), np.zeros(len(neg_val))]).astype(np.float32)
+    flat_v2 = val_X2.reshape(-1, feat_dim)
+    flat_v2 -= scaler2.mean_
+    flat_v2 /= (scaler2.scale_ + 1e-8)
+
+    train_y2 = train_y2.astype(np.float32)
+    train_ds2 = TensorDataset(torch.from_numpy(train_X2), torch.from_numpy(train_y2))
+    val_ds2 = TensorDataset(torch.from_numpy(val_X2), torch.from_numpy(val_y2))
+    del train_X2, val_X2
+    gc.collect()
+    train_loader2 = DataLoader(train_ds2, batch_size=128, shuffle=True, num_workers=0, pin_memory=True)
+    val_loader2 = DataLoader(val_ds2, batch_size=128, shuffle=False, num_workers=0, pin_memory=True)
+
+    optimizer2 = optim.Adam(model.parameters(), lr=5e-4, weight_decay=1e-4)
+    scheduler2 = optim.lr_scheduler.ReduceLROnPlateau(optimizer2, patience=3, factor=0.5, mode='max')
+
+    best_auroc = 0
+    best_state = None
+    no_improve = 0
+
+    for epoch in range(phase2_epochs):
+        model.train()
+        train_loss = 0
+        for X_batch, y_batch in train_loader2:
+            X_batch, y_batch = X_batch.to(DEVICE), y_batch.to(DEVICE)
+            optimizer2.zero_grad()
+            loss = criterion(model(X_batch), y_batch)
+            loss.backward()
+            optimizer2.step()
+            train_loss += loss.item()
+        train_loss /= len(train_loader2)
+
+        model.eval()
+        all_probs = []
+        all_labels_v = []
+        with torch.no_grad():
+            for X_batch, y_batch in val_loader2:
+                probs = torch.sigmoid(model(X_batch.to(DEVICE))).cpu().numpy()
+                all_probs.extend(probs)
+                all_labels_v.extend(y_batch.numpy())
+        all_probs = np.array(all_probs)
+        all_labels_v = np.array(all_labels_v)
+        auroc = roc_auc_score(all_labels_v, all_probs)
+
+        precisions, recalls, thresholds = precision_recall_curve(all_labels_v, all_probs)
+        f1s = 2 * precisions * recalls / (precisions + recalls + 1e-8)
+        best_f1_idx = np.argmax(f1s)
+        best_f1 = f1s[best_f1_idx]
+        best_thresh = thresholds[best_f1_idx] if best_f1_idx < len(thresholds) else 0.5
+
+        scheduler2.step(auroc)
+        history.append({'epoch': phase1_epochs + epoch + 1, 'phase': 2,
+                        'train_loss': float(train_loss), 'auroc': float(auroc),
+                        'best_f1': float(best_f1)})
+
+        if auroc > best_auroc:
+            best_auroc = auroc
+            best_state = deepcopy(model.state_dict())
+            best_f1_final = best_f1
+            best_thresh_final = best_thresh
+            no_improve = 0
+        else:
+            no_improve += 1
+
+        if (epoch+1) % 5 == 0 or epoch == 0 or no_improve == 0:
+            print(f"    P2 Epoch {epoch+1:3d}: loss={train_loss:.4f} AUROC={auroc:.4f} "
+                  f"F1={best_f1:.4f} {'*' if no_improve==0 else ''}")
+
+        if no_improve >= 7:
+            print(f"    Early stopping at P2 epoch {epoch+1}")
+            break
+
+    model.load_state_dict(best_state)
+    model.eval()
+
+    return model, scaler2, {
+        'best_auroc': float(best_auroc),
+        'best_f1': float(best_f1_final),
+        'best_threshold': float(best_thresh_final),
+        'epochs_trained': len(history),
+        'history': history,
+    }
+
+
+def shuffled_label_check(train_X, train_y, val_X, val_y):
+    """Train with shuffled labels to verify model isn't memorizing."""
+    print("\n  Shuffled label sanity check...")
+    rng = np.random.RandomState(SEED)
+    y_shuf = rng.permutation(train_y)
+    model = CNN1D(input_dim=INPUT_DIM)
+    _, _, results = train_model(model, train_X, y_shuf, val_X, val_y,
+                                epochs=15, patience=5)
+    print(f"  Shuffled AUROC: {results['best_auroc']:.4f} (should be ~0.5)")
+    return results['best_auroc']
+
+
+def main():
+    import gc
+    t0 = time.time()
+    torch.manual_seed(SEED)
+    np.random.seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(SEED)
+
+    print("=" * 70)
+    print("STEP 3: TRAIN DETECTOR VARIANTS")
+    print(f"Device: {DEVICE}")
+    print("=" * 70)
+
+    rng = np.random.RandomState(SEED)
+
+    # Load existing data and separate pos/neg immediately
+    print("\nLoading existing training data...")
+    data = np.load(EXISTING_DATA)
+    train_X, train_y = data['train_X'], data['train_y']
+    val_X, val_y = data['val_X'], data['val_y']
+    print(f"  Existing: train={len(train_X)} ({train_y.sum():.0f} pos, "
+          f"{(1-train_y).sum():.0f} neg), val={len(val_X)}")
+
+    pos_train = train_X[train_y == 1].copy()
+    easy_neg_train = train_X[train_y == 0].copy()
+    pos_val = val_X[val_y == 1].copy()
+    easy_neg_val = val_X[val_y == 0].copy()
+    del train_X, train_y, val_X, val_y, data
+    gc.collect()
+
+    n_pos_train = len(pos_train)
+    n_pos_val = len(pos_val)
+    print(f"  Positives: train={n_pos_train}, val={n_pos_val}")
+    print(f"  Easy negatives: train={len(easy_neg_train)}, val={len(easy_neg_val)}")
+
+    # Load hard negatives — subsample immediately to save memory
+    # We need at most n_pos_train for training + n_pos_val for val
+    max_hard_needed = n_pos_train + n_pos_val + 1000  # small margin
+    print(f"\nLoading hard negatives (need at most {max_hard_needed:,})...")
+
+    a_path = os.path.join(HARD_NEG_DIR, 'method_a_windows.npz')
+    b_path = os.path.join(HARD_NEG_DIR, 'method_b_windows.npz')
+
+    hard_parts = []
+    for label, path in [('Method A', a_path), ('Method B', b_path)]:
+        if os.path.exists(path):
+            d = np.load(path)
+            w = d['windows']
+            print(f"  {label}: {len(w):,} windows")
+            hard_parts.append(w)
+            del d
+
+    if not hard_parts:
+        raise RuntimeError("No hard negative windows found!")
+
+    hard_neg_all = np.vstack(hard_parts) if len(hard_parts) > 1 else hard_parts[0]
+    del hard_parts
+    gc.collect()
+
+    # Shuffle and subsample to what we need
+    total_hard = len(hard_neg_all)
+    perm = rng.permutation(total_hard)
+    n_keep = min(total_hard, max_hard_needed)
+    hard_neg_sub = hard_neg_all[perm[:n_keep]].copy()
+    del hard_neg_all, perm
+    gc.collect()
+    print(f"  Subsampled: {len(hard_neg_sub):,} windows (from {total_hard:,})")
+
+    # Split hard negatives 80/20
+    split_idx = int(len(hard_neg_sub) * 0.8)
+    hard_neg_train = hard_neg_sub[:split_idx]
+    hard_neg_val = hard_neg_sub[split_idx:]
+    print(f"  Hard neg split: train={len(hard_neg_train):,}, val={len(hard_neg_val):,}")
+
+    all_results = {}
+
+    # ══════════════════════════════════════════════════════════════════
+    # VARIANT 1: Hard only
+    # ══════════════════════════════════════════════════════════════════
+    print(f"\n{'='*60}")
+    print("V1: HARD ONLY (100% hard negatives)")
+    print(f"{'='*60}")
+
+    n_hard = min(n_pos_train, len(hard_neg_train))
+    idx = rng.choice(len(hard_neg_train), size=n_hard, replace=False)
+    v1_neg_train = hard_neg_train[idx]
+
+    v1_train_X = np.vstack([pos_train, v1_neg_train])
+    v1_train_y = np.concatenate([np.ones(n_pos_train), np.zeros(len(v1_neg_train))])
+    del v1_neg_train
+
+    n_hard_val = min(n_pos_val, len(hard_neg_val))
+    idx_v = rng.choice(len(hard_neg_val), size=n_hard_val, replace=False)
+    v1_val_X = np.vstack([pos_val, hard_neg_val[idx_v]])
+    v1_val_y = np.concatenate([np.ones(n_pos_val), np.zeros(n_hard_val)])
+
+    print(f"  Train: {len(v1_train_X)} ({n_pos_train} pos + {n_hard} neg)")
+
+    model1 = CNN1D(input_dim=INPUT_DIM)
+    model1, scaler1, res1 = train_model(model1, v1_train_X, v1_train_y, v1_val_X, v1_val_y)
+    print(f"\n  RESULT: AUROC={res1['best_auroc']:.4f}, F1={res1['best_f1']:.4f}")
+
+    torch.save({
+        'model_state_dict': model1.state_dict(),
+        'scaler_mean': scaler1.mean_, 'scaler_scale': scaler1.scale_,
+        'input_dim': INPUT_DIM, 'window_size': WINDOW_SIZE,
+        'model_type': 'CNN1D',
+        'auroc': res1['best_auroc'], 'best_f1': res1['best_f1'],
+        'best_threshold': res1['best_threshold'],
+        'variant': 'hard_only',
+    }, os.path.join(MODEL_DIR, 'variant1_hard_only.pt'))
+    all_results['V1_hard_only'] = res1
+
+    # Shuffled label check on V1
+    shuf_auroc = shuffled_label_check(v1_train_X, v1_train_y, v1_val_X, v1_val_y)
+    all_results['V1_shuffled_auroc'] = float(shuf_auroc)
+    del v1_train_X, v1_train_y, v1_val_X, v1_val_y, model1, scaler1
+    gc.collect()
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+    # ══════════════════════════════════════════════════════════════════
+    # VARIANT 2: 50/50
+    # ══════════════════════════════════════════════════════════════════
+    print(f"\n{'='*60}")
+    print("V2: 50/50 MIX (50% hard + 50% easy)")
+    print(f"{'='*60}")
+
+    n_each = n_pos_train // 2
+    idx_h = rng.choice(len(hard_neg_train), size=min(n_each, len(hard_neg_train)), replace=False)
+    idx_e = rng.choice(len(easy_neg_train), size=min(n_each, len(easy_neg_train)), replace=False)
+    v2_neg_train = np.vstack([hard_neg_train[idx_h], easy_neg_train[idx_e]])
+
+    v2_train_X = np.vstack([pos_train, v2_neg_train])
+    v2_train_y = np.concatenate([np.ones(n_pos_train), np.zeros(len(v2_neg_train))])
+    del v2_neg_train
+
+    n_each_v = n_pos_val // 2
+    idx_hv = rng.choice(len(hard_neg_val), size=min(n_each_v, len(hard_neg_val)), replace=False)
+    idx_ev = rng.choice(len(easy_neg_val), size=min(n_each_v, len(easy_neg_val)), replace=False)
+    v2_val_neg = np.vstack([hard_neg_val[idx_hv], easy_neg_val[idx_ev]])
+    v2_val_X = np.vstack([pos_val, v2_val_neg])
+    v2_val_y = np.concatenate([np.ones(n_pos_val), np.zeros(len(v2_val_neg))])
+    del v2_val_neg
+
+    print(f"  Train: {len(v2_train_X)} ({n_pos_train} pos + {n_each*2} neg)")
+
+    model2 = CNN1D(input_dim=INPUT_DIM)
+    model2, scaler2, res2 = train_model(model2, v2_train_X, v2_train_y, v2_val_X, v2_val_y)
+    print(f"\n  RESULT: AUROC={res2['best_auroc']:.4f}, F1={res2['best_f1']:.4f}")
+
+    torch.save({
+        'model_state_dict': model2.state_dict(),
+        'scaler_mean': scaler2.mean_, 'scaler_scale': scaler2.scale_,
+        'input_dim': INPUT_DIM, 'window_size': WINDOW_SIZE,
+        'model_type': 'CNN1D',
+        'auroc': res2['best_auroc'], 'best_f1': res2['best_f1'],
+        'best_threshold': res2['best_threshold'],
+        'variant': '50_50',
+    }, os.path.join(MODEL_DIR, 'variant2_50_50.pt'))
+    all_results['V2_50_50'] = res2
+    del v2_train_X, v2_train_y, v2_val_X, v2_val_y, model2, scaler2
+    gc.collect()
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+    # ══════════════════════════════════════════════════════════════════
+    # VARIANT 3: 75/25
+    # ══════════════════════════════════════════════════════════════════
+    print(f"\n{'='*60}")
+    print("V3: 75/25 MIX (75% hard + 25% easy)")
+    print(f"{'='*60}")
+
+    n_hard3 = int(n_pos_train * 0.75)
+    n_easy3 = n_pos_train - n_hard3
+    idx_h3 = rng.choice(len(hard_neg_train), size=min(n_hard3, len(hard_neg_train)), replace=False)
+    idx_e3 = rng.choice(len(easy_neg_train), size=min(n_easy3, len(easy_neg_train)), replace=False)
+    v3_neg_train = np.vstack([hard_neg_train[idx_h3], easy_neg_train[idx_e3]])
+
+    v3_train_X = np.vstack([pos_train, v3_neg_train])
+    v3_train_y = np.concatenate([np.ones(n_pos_train), np.zeros(len(v3_neg_train))])
+    del v3_neg_train
+
+    n_hard3v = int(n_pos_val * 0.75)
+    n_easy3v = n_pos_val - n_hard3v
+    idx_hv3 = rng.choice(len(hard_neg_val), size=min(n_hard3v, len(hard_neg_val)), replace=False)
+    idx_ev3 = rng.choice(len(easy_neg_val), size=min(n_easy3v, len(easy_neg_val)), replace=False)
+    v3_val_neg = np.vstack([hard_neg_val[idx_hv3], easy_neg_val[idx_ev3]])
+    v3_val_X = np.vstack([pos_val, v3_val_neg])
+    v3_val_y = np.concatenate([np.ones(n_pos_val), np.zeros(len(v3_val_neg))])
+    del v3_val_neg
+
+    print(f"  Train: {len(v3_train_X)} ({n_pos_train} pos + {n_hard3+n_easy3} neg)")
+
+    model3 = CNN1D(input_dim=INPUT_DIM)
+    model3, scaler3, res3 = train_model(model3, v3_train_X, v3_train_y, v3_val_X, v3_val_y)
+    print(f"\n  RESULT: AUROC={res3['best_auroc']:.4f}, F1={res3['best_f1']:.4f}")
+
+    torch.save({
+        'model_state_dict': model3.state_dict(),
+        'scaler_mean': scaler3.mean_, 'scaler_scale': scaler3.scale_,
+        'input_dim': INPUT_DIM, 'window_size': WINDOW_SIZE,
+        'model_type': 'CNN1D',
+        'auroc': res3['best_auroc'], 'best_f1': res3['best_f1'],
+        'best_threshold': res3['best_threshold'],
+        'variant': '75_25',
+    }, os.path.join(MODEL_DIR, 'variant3_75_25.pt'))
+    all_results['V3_75_25'] = res3
+    del v3_train_X, v3_train_y, v3_val_X, v3_val_y, model3, scaler3
+    gc.collect()
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+    # ══════════════════════════════════════════════════════════════════
+    # VARIANT 4: Curriculum
+    # ══════════════════════════════════════════════════════════════════
+    print(f"\n{'='*60}")
+    print("V4: CURRICULUM (easy first, then hard)")
+    print(f"{'='*60}")
+
+    v4_val_neg = hard_neg_val[:n_pos_val] if len(hard_neg_val) >= n_pos_val else hard_neg_val
+    model4, scaler4, res4 = train_curriculum(
+        pos_train, easy_neg_train, hard_neg_train,
+        pos_val, v4_val_neg,
+        phase1_epochs=10, phase2_epochs=40)
+    print(f"\n  RESULT: AUROC={res4['best_auroc']:.4f}, F1={res4['best_f1']:.4f}")
+
+    torch.save({
+        'model_state_dict': model4.state_dict(),
+        'scaler_mean': scaler4.mean_, 'scaler_scale': scaler4.scale_,
+        'input_dim': INPUT_DIM, 'window_size': WINDOW_SIZE,
+        'model_type': 'CNN1D',
+        'auroc': res4['best_auroc'], 'best_f1': res4['best_f1'],
+        'best_threshold': res4['best_threshold'],
+        'variant': 'curriculum',
+    }, os.path.join(MODEL_DIR, 'variant4_curriculum.pt'))
+    all_results['V4_curriculum'] = res4
+
+    # Save training logs
+    for name, res in [('V1_hard_only', res1), ('V2_50_50', res2),
+                      ('V3_75_25', res3), ('V4_curriculum', res4)]:
+        with open(os.path.join(LOG_DIR, f'{name}_history.json'), 'w') as f:
+            json.dump(res['history'], f, indent=2)
+
+    # Summary
+    summary = {}
+    for name in ['V1_hard_only', 'V2_50_50', 'V3_75_25', 'V4_curriculum']:
+        r = all_results[name]
+        summary[name] = {
+            'auroc': r['best_auroc'],
+            'best_f1': r['best_f1'],
+            'best_threshold': r['best_threshold'],
+            'epochs_trained': r['epochs_trained'],
+        }
+    summary['shuffled_auroc_V1'] = all_results.get('V1_shuffled_auroc', None)
+
+    with open(os.path.join(LOG_DIR, 'training_summary.json'), 'w') as f:
+        json.dump(summary, f, indent=2)
+
+    elapsed = time.time() - t0
+    print(f"\n{'='*70}")
+    print(f"TRAINING COMPLETE ({elapsed/60:.1f} min)")
+    print(f"{'='*70}")
+    for name in ['V1_hard_only', 'V2_50_50', 'V3_75_25', 'V4_curriculum']:
+        r = all_results[name]
+        print(f"  {name}: AUROC={r['best_auroc']:.4f}, F1={r['best_f1']:.4f}")
+    print(f"  Shuffled label check: AUROC={all_results.get('V1_shuffled_auroc', 'N/A')}")
+
+
+if __name__ == '__main__':
+    main()

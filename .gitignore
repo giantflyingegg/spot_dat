@@ -1,0 +1,7 @@
+*.npz
+*.npy
+*.csv
+landmarks/
+detections/
+__pycache__/
+*.pyc
