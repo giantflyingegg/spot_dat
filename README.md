@@ -117,6 +117,16 @@ Every cell names **checkpoint · test set · post-processing config**.
 Right-handed F1 0.6236 → 0.6871 → 0.7934; left-handed 0.2151 → 0.6410 → 0.7280. The
 R−L gap runs 0.4085 → 0.0461 → 0.0654.
 
+### Checkpoints in this repository
+
+| checkpoint | role |
+|---|---|
+| `models/variant3_75_25.pt` | V3 baseline, carried over from `main` |
+| `models/variant3_flipaug.pt` | flip-augmented, the fine-tune's starting point |
+| `models/variant3_control.pt` | control checkpoint; **not evaluated in the 2×3 matrix and no evaluation is on record. Shipped for completeness.** |
+| `models/gbt_v3.pkl`, `models/gbt_v3_flipaug.pkl` | segment-level filters, original and refitted |
+| `variant4_signhealth_ft.pt` | **held privately** — SignHealth-fine-tuned weights |
+
 ### Deployment operating point
 
 **`k3 / th0.30 / gap0 / min0.2 / cf0 / ext0`** — the full config, from
@@ -190,6 +200,7 @@ Reproduction check, 2026-07-23: `eval_570_frozen.py` reproduced the archived res
 
 ```
 retrain/         train_variant4.py            (+ flip-aug branch training code)
+                 plot_training_curves.py      renders the *_history.json curves
 models/          variant4_signhealth_ft_history.json   (weights held privately)
 hard_negatives/  extract_signhealth_{positives,flanks,easyneg}.py
                  assemble_signhealth_ft.py, sh_ft_assembly.json
@@ -197,7 +208,16 @@ eval/            eval_570_frozen.py  (citable) · eval_570.py (provenance only)
                  README_eval570.md · test570_probs_provenance.json
 deploy/          regen_signhealth_v4_deploy.py
 queue/           build_detection_queue_v4.py  (+ flip-aug builder)
+reports/         HARD_NEGATIVE_REPORT.md      hard-negative mining analysis
+                 TRAINING_AUDIT_REPORT.md     V3 training-procedure leak audit
+                 UNIFIED_SOURCE_REPORT.md     unified dataset source accounting
 ```
+
+**Training-curve figures are not committed.** `training_curves_audit.png` and
+`v3_training_detail_audit.png` are regenerable from `retrain/plot_training_curves.py`
+together with the `models/variant3_{flipaug,control}_history.json` and
+`models/variant4_signhealth_ft_history.json` files already in this repository. The script
+and its inputs are versioned; the rendered output is not.
 
 ## Not in this repository
 
