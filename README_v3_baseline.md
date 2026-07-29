@@ -9,7 +9,7 @@ Binary detector for fingerspelling segments in British Sign Language (BSL) video
 1D CNN binary classifier over per-frame landmark features.
 
 - **Input:** 158-dim features (hand landmarks + wrist distances + motion deltas) over 25-frame windows
-- **Architecture:** 1D CNN, hard-negative trained (variant3, 75/25 pos/neg split)
+- **Architecture:** 1D CNN, hard-negative trained (variant3). The 75/25 ratio is the **hard/easy split within the negative class** — 92,640 hard / 30,881 easy of 123,521 negatives — not a positive/negative split. See `TRAINING_AUDIT_REPORT.md` §6.2.
 - **Performance:** 85.8% precision / 92.3% recall on BOBSL validation
 
 **Detection pipeline thresholds:**
