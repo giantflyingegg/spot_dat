@@ -1,0 +1,28 @@
+{
+  "flip": {
+    "enabled": true,
+    "p": 0.5
+  },
+  "scale": {
+    "enabled": false,
+    "p": 0.5,
+    "range": [
+      0.8,
+      1.5
+    ],
+    "mode": "3d_sim"
+  },
+  "speed": {
+    "enabled": false,
+    "p": 0.5,
+    "range": [
+      0.85,
+      1.15
+    ]
+  },
+  "refit_feature_scaler": false,
+  "_arm": "stage1_headline_flip_only",
+  "_coin_granularity": "per_window",
+  "_flip_build": "per_segment_raw_landmark_hflip_then_window (bit-exact aligned to banked orig)",
+  "_select_metric": "min(orig_val_F1, flip_val_F1)"
+}
