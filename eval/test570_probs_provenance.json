@@ -1,0 +1,51 @@
+{
+  "artifact": "frozen-570 cached inference probs",
+  "generated_at": "2026-07-19T20:32:39+00:00",
+  "iou": 0.3,
+  "n_R": 16,
+  "n_L": 3,
+  "checkpoints": {
+    "variant3": {
+      "path": "/home/gfe/bsl_project/robustness_diag/retrain/variant3_flipaug.pt",
+      "md5": "b05116190d50"
+    },
+    "variant4": {
+      "path": "/home/gfe/bsl_project/robustness_diag/retrain/variant4_signhealth_ft.pt",
+      "md5": "23cf30dc5deb"
+    }
+  },
+  "feature_run_per_video": {
+    "-J-YFzNM36g": "2026-07-13",
+    "151122979": "2026-07-13",
+    "218422286": "2026-07-13",
+    "2wHBMrWwpdI": "2026-07-13",
+    "3OQrBoj-3E0": "2026-07-13",
+    "3uFZS1_wMfI": "2026-07-13",
+    "749998408": "2026-07-13",
+    "Gc2UnkUwdwA": "2026-07-13",
+    "LFZClXeo1BE": "2026-07-13",
+    "Mah6XgdWUAM": "2026-07-13",
+    "QhaRg0I1Z60": "2026-07-13",
+    "T3kvq3CpcEE": "2026-07-13",
+    "Uhf4Xjk6Row": "2026-07-13",
+    "ZSdrhHhx1IA": "2026-07-13",
+    "aTWKHl4l9io": "2026-07-13",
+    "agpUuqrpAjQ": "2026-07-13",
+    "02yZp28stf0": "2026-07-13",
+    "3sAXdMvh_sU": "2026-07-13",
+    "hNEOGcY2toE": "2026-07-13"
+  },
+  "operating_points": {
+    "V4_LOCK": {
+      "smooth_kernel": 5,
+      "threshold": 0.6,
+      "gap_bridge_s": 0.0,
+      "min_duration_s": 0.3,
+      "conf_filter": 0.0,
+      "boundary_extend_s": 0.1
+    },
+    "V3_LOCK": "PipelineConfig(smooth_kernel=3, threshold=0.8, gap_bridge_s=0.0, min_duration_s=0.5, conf_filter=0.0, boundary_extend_s=0.0)",
+    "B4": "PipelineConfig(smooth_kernel=7, threshold=0.5, gap_bridge_s=0.0, min_duration_s=0.2, conf_filter=0.5, boundary_extend_s=0.1)"
+  },
+  "note": "All reported operating points derive from this one archived inference pass."
+}

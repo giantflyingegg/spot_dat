@@ -1,157 +1,230 @@
-# spot_dat — branch `detector/flip-aug`
+# spot_dat — branch `detector/v4-signhealth-ft`
 
-Flip augmentation for the BSL fingerspelling detector, applied at the **raw landmark
-stage**, together with the two coordinate-convention fixes it depends on.
+Hard-negative fine-tune of the flip-augmented detector onto SignHealth-domain video,
+plus the frozen evaluation harness and the deployment operating point.
 
-Baseline this branch modifies: `main` (V3 detector, `models/variant3_75_25.pt`). The
-original V3 documentation is preserved unchanged as
-[`README_v3_baseline.md`](README_v3_baseline.md).
+Branched from [`detector/flip-aug`](../../tree/detector/flip-aug), which is where the
+coordinate fixes and the flip augmentation are documented. This branch is the fine-tune
+alone: `variant4_signhealth_ft.pt` starts from `variant3_flipaug.pt` (recorded in the
+training history as `start_ckpt_md5: b05116190d50`).
 
-Downstream branch: `detector/v4-signhealth-ft`, which fine-tunes *from* the checkpoint
-produced here.
+**The v4 checkpoint itself is not in this repository.** It is fine-tuned on
+SignHealth-derived features and is held in a private companion repository. The training
+script, the training history, the extraction rules and every reported number are here.
 
 ---
 
-## What this branch changes vs `main`
+## Hard-negative extraction
 
-| | `main` | this branch |
+SignHealth-domain negatives mined from videos annotated exhaustively, excluding the frozen
+test set. Window geometry throughout: **25 frames** (1.0 s at 25 fps), **stride 5** for
+negative pools, **158-dim** features.
+
+Flank rules, as implemented in `hard_negatives/extract_signhealth_flanks.py`:
+
+| rule | value | meaning |
 |---|---|---|
-| coordinate handling | hand blocks occasionally swapped; anisotropic x/z | wrist-probe de-swap **+** isotropy correction, applied together |
-| augmentation | none | horizontal flip at raw-landmark stage, per-window p=0.5 |
-| GBT filter | `gbt_v3.pkl`, fitted on one orientation | `gbt_v3_flipaug.pkl`, refitted across both orientations |
-| left-handed signers | effectively undetected | detected at F1 0.6410 |
+| R1 `NEAR_S` | **5.0 s** | window centre must lie within 5 s of an annotated span — near-miss negatives, not arbitrary background |
+| R2 `MARGIN_S` | **0.5 s** | safety margin around every span; nothing within 0.5 s of a positive can become a negative |
+| R3 `HAND_FRAC` | **0.5** | at least 50 % of frames in the window must have hand presence, or the window is discarded |
+| R4 `OUTLIER` | 100.0 | per-frame outlier rejection threshold |
 
-New checkpoints: `models/variant3_flipaug.pt` (the headline), `models/variant3_control.pt`
-(same recipe, augmentation off — the control), `models/gbt_v3_flipaug.pkl`.
+**Scope: done-minus-19.** Negatives are drawn only from videos marked exhaustively
+annotated, minus the 19 frozen test videos. Exhaustive annotation is what licenses the
+negative label — on a partially annotated video an unlabelled region is not evidence of
+absence. The exclusion list is loaded from the two freeze JSONs, never hand-maintained.
 
----
+Three pools: `extract_signhealth_positives.py`, `extract_signhealth_flanks.py`,
+`extract_signhealth_easyneg.py`; assembled by `assemble_signhealth_ft.py`, which records
+what it consumed in `hard_negatives/sh_ft_assembly.json` — seed 42, train 60,844 windows
+(pos 10,811 / flank 28,411 / easy 21,622, positive fraction 0.1777), val 11,362, and the
+three pool hashes.
 
-## The two coordinate bugs — and why they had to be fixed together
+## Dual positive-window convention
 
-Two independent defects in the landmark → feature path:
+Positive windows are built two ways depending on span length, because one convention
+cannot serve both (`hard_negatives/extract_signhealth_positives.py`):
 
-1. **Hand-block swap.** Left and right hand blocks were intermittently transposed in the
-   landmark array. Corrected by a **wrist probe**: comparing block-1566 against pose
-   landmark 15 to establish which block is which, then de-swapping. Implemented in
-   `regen/regen_transforms.py`; each regenerated feature file records
-   `wrist_probe_block1566_to_pose15` and the number of valid probe frames in its
-   `.provenance.json` sidecar.
+- **`L >= 25` frames — standard containment.** 25-frame windows fully *inside* the span,
+  stride 3. This is the unchanged BOBSL convention.
+- **`5 <= L < 25` frames — inverted containment-jitter.** 25-frame windows that fully
+  *contain* the span, jittered at stride 3 across every offset where `span ⊆ window`,
+  using real frames only and **never zero-padding**. The label is deliberately impure:
+  fingerspelling-frame fraction is `L/25`.
 
-2. **Anisotropy.** Landmark x and z were normalised against a different extent than y,
-   so the coordinate space was stretched by the source aspect ratio. Corrected by
-   `x, z *= W/H`, with `W/H` read per video from `ffprobe`.
+Spans shorter than `MIN_SPAN_F = 5` frames are dropped.
 
-> **They must be applied together.** Fixing isotropy alone — de-swap still absent — drove
-> validation F1 to **0.022**. The isotropy correction makes the geometry metrically
-> honest, which makes a swapped hand block a far worse error than it was in the distorted
-> space: the model had been partly absorbing the swap as noise, and could no longer.
-> Anyone porting one fix without the other should expect the detector to collapse, not
-> to degrade gracefully.
+Without the inverted branch, every span under one second contributes no positive window at
+all and the detector is trained blind to exactly the class the containment annotation
+convention exists to capture. The impure label is the price of seeing them.
 
-The de-swap is applied to the **raw landmarks**, before feature extraction, so the flip
-augmentation below composes with it cleanly.
+## Test-set lockout
 
-## Flip augmentation — raw landmark stage, not feature vector
+The 19 frozen test videos are excluded at **both** ends, from a single source of truth —
+`analysis/frozen_test_videos.json` and `analysis/frozen_test_L_supplement.json`:
 
-The flip is `transforms.hflip(lm_dsw)` on de-swapped raw landmarks, after which the full
-158-dim feature extractor runs again on the flipped landmarks. It is **not** a permutation
-or sign-flip applied to an already-built feature vector.
+- **build time** — `queue/build_detection_queue_v4.py` and the flip-aug builder both call
+  the shared `lockout()` and log the drop count and survivors on every run. The builder
+  **aborts** if the lockout list loads empty or its id count fails to match the declared
+  count, rather than proceeding unlocked.
+- **serve time** — the annotation server loads the same two JSONs into
+  `EXCLUDED_TEST_VIDEOS` via `assert_test_lockout()` and reports the locked set on every
+  start.
 
-This matters because the 158-dim vector contains derived quantities — inter-hand
-distances, motion deltas, presence flags — whose correct values under reflection are not
-recoverable by reindexing the unflipped vector. Flipping late produces a vector that is
-self-inconsistent; flipping early produces a genuine mirrored example.
+The belt-and-braces arrangement exists because clips from test videos were found live in
+the serving queue before the lockout was added. *(The exact count of leaked clips is
+recorded in session notes only; no on-disk artefact carries it, so it is not asserted
+here.)*
 
-Configuration (`retrain/aug_config_stage1.json`): flip enabled, `p=0.5`, coin flipped
-**per window**; scale and speed augmentation off for this arm; feature scaler **not**
-refitted (banked). Model selection used `min(orig_val_F1, flip_val_F1)` so a checkpoint
-could not win by being good in one orientation only.
+## Fine-tune
 
-**The GBT filter is refitted across both orientations** (`retrain/train_gbt_flipaug.py`
-→ `models/gbt_v3_flipaug.pkl`). Reusing the original `gbt_v3.pkl` would have left a
-segment-level filter tuned on right-handed segment statistics sitting downstream of an
-orientation-agnostic frame model.
+`retrain/train_variant4.py`, starting from `variant3_flipaug.pt`. Config from the
+recorded history: lr 1e-4, weight decay 1e-4, batch 128, **50/50 BOBSL/SignHealth mix**,
+flip augmentation on (per-window p=0.5), feature scaler **banked, not refit**, early stop
+on SignHealth-val F1 with patience 7, max 50 epochs.
+
+| | value |
+|---|---|
+| best epoch | 8 (stopped at 15) |
+| SignHealth val F1 | 0.8571 at epoch 0 → **0.8802** at best (+0.0232) |
+| BOBSL val F1 at best | 0.9656 (Δ **−0.0015** vs epoch 0) |
+| tripwire | **not triggered** — BOBSL val F1 stayed within 0.03 of epoch 0 |
+| wall clock | 27.4 s |
+
+The tripwire is the point: the fine-tune was allowed to proceed only while BOBSL
+performance held. It bought +2.3 points of in-domain F1 for 0.15 points of out-of-domain
+loss.
 
 ---
 
 ## Results
 
-Every cell below names **checkpoint · test set · post-processing config**. No number in
-this repository is quoted without all three.
+Every cell names **checkpoint · test set · post-processing config**.
 
-**Post-processing config `B4`** — `smooth_kernel=7, threshold=0.50, gap_bridge_s=0.0,
-min_duration_s=0.2, conf_filter=0.5, boundary_extend_s=0.1`. Matching at **IoU 0.3**.
-**GBT off.**
-
-**Test sets.** `R16` = 16 right-handed videos, 447 ground-truth spans. `L3` = 3
-left-handed videos, 123 spans. Both frozen; the ground truth itself is held privately.
-Figures are micro-pooled (TP/FP/FN summed across videos, then P/R/F1).
+**PP config `B4`** — `k7 / th0.50 / gap0 / min0.2 / cf0.5 / ext0.1`, IoU 0.3, **GBT off**.
+**Test sets:** `R16` = 16 right-handed videos / 447 spans; `L3` = 3 left-handed videos /
+123 spans. Micro-pooled.
 
 | checkpoint | test set | P | R | **F1** |
 |---|---|---|---|---|
-| `variant3_75_25.pt` (`main` baseline) | R16, B4, GBT off | 0.5253 | 0.7673 | **0.6236** |
-| `variant3_75_25.pt` | L3, B4, GBT off | 0.2109 | 0.2195 | **0.2151** |
-| **`variant3_flipaug.pt`** | R16, B4, GBT off | 0.6017 | 0.8009 | **0.6871** |
-| **`variant3_flipaug.pt`** | L3, B4, GBT off | 0.5291 | 0.8130 | **0.6410** |
+| `variant3_75_25.pt` | R16, B4, GBT off | 0.5253 | 0.7673 | 0.6236 |
+| `variant3_flipaug.pt` | R16, B4, GBT off | 0.6017 | 0.8009 | 0.6871 |
+| **`variant4_signhealth_ft.pt`** | R16, B4, GBT off | 0.7756 | 0.8121 | **0.7934** |
+| `variant3_75_25.pt` | L3, B4, GBT off | 0.2109 | 0.2195 | 0.2151 |
+| `variant3_flipaug.pt` | L3, B4, GBT off | 0.5291 | 0.8130 | 0.6410 |
+| **`variant4_signhealth_ft.pt`** | L3, B4, GBT off | 0.7165 | 0.7398 | **0.7280** |
 
-The right-handed gain is real but modest, +0.0635 F1. The left-handed change is the
-result: **0.2151 → 0.6410**, and the R−L gap closes from 0.4085 to 0.0461.
+Right-handed F1 0.6236 → 0.6871 → 0.7934; left-handed 0.2151 → 0.6410 → 0.7280. The
+R−L gap runs 0.4085 → 0.0461 → 0.0654.
 
-Read the baseline's L3 row honestly: at P 0.2109 / R 0.2195 the unaugmented detector is
-not weak on left-handed signers, it is close to non-functional on them.
+### Deployment operating point
 
-### With the GBT filter on
+**`k3 / th0.30 / gap0 / min0.2 / cf0 / ext0`** — the full config, from
+`deploy/regen_signhealth_v4_deploy.py`. Note `cf0` and `ext0`: the confidence filter and
+boundary extension are both **off**, which is easy to drop when the point is quoted
+informally as "k3/th.3/min.2".
 
-**Post-processing config `native banked`** — `k11 / th0.30 / gap0.5 / min0.5 / cf0.60 /
-ext0.2`, GBT keep rule `predict_proba[TP] >= 0.5`. R16 only; **no GBT-on evaluation exists
-for any left-handed set.**
+Selected on a **7-video validation set**, not on the test set. The per-video validation
+results are held privately, so the selection cannot be re-derived from this repository —
+the claim stands on the recorded rationale and on the test figures below, which are
+independent of the selection.
 
-| checkpoint + filter | test set | P | R | **F1** |
-|---|---|---|---|---|
-| `variant3_75_25.pt` + `gbt_v3.pkl` | R16, native banked, GBT on | 0.6351 | 0.5257 | **0.5753** |
-| `variant3_flipaug.pt` + `gbt_v3_flipaug.pkl` | R16, native banked, GBT on | 0.7097 | 0.5414 | **0.6142** |
+Rationale, verbatim from the script: the `min_dur` floor is aligned to the training span
+floor (0.2 s = 5 frames) because *"min_dur is a structural exclusion not a soft knob, so a
+0.3 s floor would re-blind the queue to sub-0.3s single letters"* — the same class the
+containment convention above exists to capture. Recall-priority, per the false-negative
+cost argument.
 
-The refitted filter improves precision markedly (0.6351 → 0.7097) at similar recall. Both
-GBT-on rows sit below their GBT-off counterparts on F1, which is the beginning of the
-case for running the deployed detector with the filter off — the argument is completed on
-`detector/v4-signhealth-ft`.
+`variant4_signhealth_ft.pt` at DEPLOY, IoU 0.3, GBT off, micro-pooled:
+
+| test set | TP | FP | FN | P | R | **F1** |
+|---|---:|---:|---:|---|---|---|
+| R16 | 376 | 152 | 71 | 0.7121 | **0.8412** | 0.7713 |
+| L3 | 95 | 62 | 28 | 0.6051 | 0.7724 | 0.6786 |
+| pooled 19 | 471 | 214 | 99 | 0.6876 | 0.8263 | 0.7506 |
+
+DEPLOY trades ~2 points of F1 against B4 for ~3 points of recall on R16 — the intended
+direction for a queue that feeds human review, where a miss costs more than a false alarm.
+
+### The case for running with GBT off
+
+| configuration | test set | **F1** |
+|---|---|---|
+| `variant3_75_25.pt` + `gbt_v3.pkl`, native banked PP, GBT **on** | R16 | 0.5753 |
+| `variant3_flipaug.pt` + `gbt_v3_flipaug.pkl`, native banked PP, GBT **on** | R16 | 0.6142 |
+| `variant3_flipaug.pt`, B4, GBT **off** | R16 | 0.6871 |
+| `variant4_signhealth_ft.pt`, B4, GBT **off** | R16 | **0.7934** |
+
+Every GBT-on row sits below its GBT-off counterpart. On the earlier BOBSL held-out
+evaluation the filter was worth **+0.001 F1** (V3 alone 0.870 → V3+GBT 0.871) while
+cutting false positives per minute by 12.4 % — a precision instrument, not an accuracy
+one. Once the frame model itself became precise (v4 R16 precision 0.7756 against 0.5253
+for the V3 baseline), the filter had little left to remove and was costing recall.
+
+**No GBT-on evaluation exists for any left-handed set, or for v4 on any set.** Any
+GBT-on claim beyond the two rows above would have to be computed first.
+
+## Frozen evaluation harness
+
+`eval/eval_570_frozen.py` is the citable evaluator. It reads ground truth from a frozen
+JSON snapshot rather than the live annotation database, and scores archived cached
+inference probabilities — it does **not** re-run inference. Results are therefore a pure
+function of (frozen GT, archived probs) and cannot drift as annotation continues.
+
+`eval/eval_570.py` reads GT live from the mutable database and is retained **only** to
+document how the original archived pass was produced. Its numbers are not citable; see
+`eval/README_eval570.md`, which also explains why the right-handed count is 447 and not
+449 (two zero-duration spans fail the `t_end_s > t_start_s` validity filter).
+
+`eval/test570_probs_provenance.json` records the checkpoints, per-video feature-run dates,
+and all three post-processing operating points (`V3_LOCK`, `V4_LOCK`, `B4`) for the
+archived inference pass. The frozen GT, the cached probability archives and the result
+JSONs are held privately.
+
+Reproduction check, 2026-07-23: `eval_570_frozen.py` reproduced the archived results
+**byte-for-byte** — archived and frozen result files share sha256 `d048ad69…`.
 
 ---
 
 ## Layout
 
 ```
-retrain/   train_v3.py, train_gbt_flipaug.py, augment.py, eval_detector.py,
-           aug_config_stage1.json
-models/    variant3_flipaug.pt, variant3_control.pt, gbt_v3_flipaug.pkl,
-           variant3_{flipaug,control}_history.json
-           (variant3_75_25.pt and gbt_v3.pkl carried over from main)
-regen/     regen_transforms.py       de-swap + isotropy + 25 fps resample
-           regen_signhealth_flipaug.py
-queue/     build_detection_queue_flipaug.py
-eval/      sweep_pp_val.py           post-processing grid sweep
+retrain/         train_variant4.py            (+ flip-aug branch training code)
+models/          variant4_signhealth_ft_history.json   (weights held privately)
+hard_negatives/  extract_signhealth_{positives,flanks,easyneg}.py
+                 assemble_signhealth_ft.py, sh_ft_assembly.json
+eval/            eval_570_frozen.py  (citable) · eval_570.py (provenance only)
+                 README_eval570.md · test570_probs_provenance.json
+deploy/          regen_signhealth_v4_deploy.py
+queue/           build_detection_queue_v4.py  (+ flip-aug builder)
 ```
-
-`models/variant3_flipaug_history.json` and `variant3_control_history.json` carry the
-per-epoch training curves and provenance for the two arms.
 
 ## Not in this repository
 
-No large arrays are committed anywhere, and **Git LFS is not used or initialised**. The
-training pools are derived and regenerable; the scripts that regenerate them are on
-`detector/v4-signhealth-ft`. Sizes, hashes, regeneration commands and input hashes are
-documented in the companion private repository, because the inputs are SignHealth-derived.
+Five derived training arrays totalling **1.00 GB** are excluded from git entirely, and
+**Git LFS is not used or initialised**. They are regenerable by the four
+`hard_negatives/` scripts, which take no arguments:
 
-Ground-truth span sets, annotation databases, cached inference probabilities and the
-per-video validation sweep results are held privately. **The numbers above are reported in
-full; the material behind them is not published.**
+```bash
+conda run -n hamer python3 extract_signhealth_positives.py
+conda run -n hamer python3 extract_signhealth_flanks.py
+conda run -n hamer python3 extract_signhealth_easyneg.py
+conda run -n hamer python3 assemble_signhealth_ft.py     # consumes the three above
+```
+
+Sizes, sha256s and the input hashes those commands consume are documented in the private
+companion repository, because the inputs are SignHealth-derived.
+
+Also held privately: `variant4_signhealth_ft.pt`, the annotation databases, the frozen
+ground-truth span sets, the cached inference probabilities, the per-video validation
+sweep, and the annotation tool. **All reported numbers appear above in full; the material
+behind them is not published.**
 
 ## Environment
 
 conda env **`hamer`** · Python **3.10.19** · torch **2.5.0+cu124** · NVIDIA RTX 4080 SUPER
 (driver 595.84). Exact package set in [`requirements-frozen.txt`](requirements-frozen.txt),
-captured from `hamer` — not from the machine's default environment, which is a different
-Python and a different torch.
+captured from `hamer` — not from the machine's default environment.
 
 Scripts reference paths from the original working tree and are published as a record of
 method, not as a turnkey pipeline.

@@ -1,0 +1,23 @@
+{
+  "seed": 42,
+  "train": {
+    "pos": 10811,
+    "flank": 28411,
+    "easy": 21622,
+    "total": 60844,
+    "pos_frac": 0.1777
+  },
+  "val": {
+    "pos": 1688,
+    "flank": 6298,
+    "easy": 3376,
+    "total": 11362,
+    "pos_frac": 0.1486
+  },
+  "pool_hashes": {
+    "positives": "6496b0d1d0d8",
+    "flanks": "2b4b25a10661",
+    "easyneg": "f62626d5552b"
+  },
+  "flip": "extract_all_frame_features(transforms.hflip(lm_dsw)) sliced at same offset"
+}

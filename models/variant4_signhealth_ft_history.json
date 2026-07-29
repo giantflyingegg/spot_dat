@@ -1,0 +1,176 @@
+{
+  "provenance": {
+    "output": "/home/gfe/bsl_project/robustness_diag/retrain/variant4_signhealth_ft.pt",
+    "start_checkpoint": "/home/gfe/bsl_project/robustness_diag/retrain/variant3_flipaug.pt",
+    "start_ckpt_md5": "b05116190d50",
+    "config": {
+      "lr": 0.0001,
+      "wd": 0.0001,
+      "batch": 128,
+      "mix": "50/50 BOBSL/SignHealth",
+      "flip_aug": "ON (per-window 50%)",
+      "scaler": "banked (not refit)",
+      "early_stop": "SignHealth-val F1, patience 7",
+      "epochs_max": 50
+    },
+    "pool_hashes": {
+      "BOBSL_positives_train": "fb5033749df6",
+      "BOBSL_hard_neg_train": "5f0a45e533d3",
+      "BOBSL_easy_neg_train": "ad77b7dcac02",
+      "SH_positives": "6496b0d1d0d8",
+      "SH_flanks": "2b4b25a10661",
+      "SH_easyneg": "f62626d5552b"
+    },
+    "sh_ft_assembly": {
+      "seed": 42,
+      "train": {
+        "pos": 10811,
+        "flank": 28411,
+        "easy": 21622,
+        "total": 60844,
+        "pos_frac": 0.1777
+      },
+      "val": {
+        "pos": 1688,
+        "flank": 6298,
+        "easy": 3376,
+        "total": 11362,
+        "pos_frac": 0.1486
+      },
+      "pool_hashes": {
+        "positives": "6496b0d1d0d8",
+        "flanks": "2b4b25a10661",
+        "easyneg": "f62626d5552b"
+      },
+      "flip": "extract_all_frame_features(transforms.hflip(lm_dsw)) sliced at same offset"
+    },
+    "convention": "DUAL positives (standard>=25f + containment-jitter 5-25f); flanks R1-4; easy BOBSL-conv; done-only negatives",
+    "epoch0": {
+      "sh_val_f1": 0.8570593343753171,
+      "bobsl_val_f1": 0.9670998738751923
+    },
+    "result": {
+      "best_epoch": 8,
+      "best_sh_val_f1": 0.8802113866621614,
+      "sh_val_f1_gain_vs_ep0": 0.0232,
+      "bobsl_val_f1_at_best": 0.9656,
+      "bobsl_delta_at_best": -0.0015,
+      "stopping_epoch": 15,
+      "wall_clock_s": 27.4
+    },
+    "tripwire": "not triggered (BOBSL-val F1 stayed within 0.03 of epoch-0)"
+  },
+  "history": [
+    {
+      "epoch": 0,
+      "sh_val_f1": 0.8570593343753171,
+      "bobsl_val_f1": 0.9670998738751923,
+      "loss": null
+    },
+    {
+      "epoch": 1,
+      "loss": 0.0993,
+      "sh_val_f1": 0.867,
+      "bobsl_val_f1": 0.9669,
+      "bobsl_drop_vs_ep0": 0.0002
+    },
+    {
+      "epoch": 2,
+      "loss": 0.0784,
+      "sh_val_f1": 0.8718,
+      "bobsl_val_f1": 0.9661,
+      "bobsl_drop_vs_ep0": 0.001
+    },
+    {
+      "epoch": 3,
+      "loss": 0.0723,
+      "sh_val_f1": 0.8718,
+      "bobsl_val_f1": 0.9663,
+      "bobsl_drop_vs_ep0": 0.0008
+    },
+    {
+      "epoch": 4,
+      "loss": 0.0678,
+      "sh_val_f1": 0.8741,
+      "bobsl_val_f1": 0.9655,
+      "bobsl_drop_vs_ep0": 0.0016
+    },
+    {
+      "epoch": 5,
+      "loss": 0.0666,
+      "sh_val_f1": 0.8729,
+      "bobsl_val_f1": 0.9653,
+      "bobsl_drop_vs_ep0": 0.0018
+    },
+    {
+      "epoch": 6,
+      "loss": 0.0636,
+      "sh_val_f1": 0.8709,
+      "bobsl_val_f1": 0.9662,
+      "bobsl_drop_vs_ep0": 0.0009
+    },
+    {
+      "epoch": 7,
+      "loss": 0.0621,
+      "sh_val_f1": 0.872,
+      "bobsl_val_f1": 0.9664,
+      "bobsl_drop_vs_ep0": 0.0007
+    },
+    {
+      "epoch": 8,
+      "loss": 0.059,
+      "sh_val_f1": 0.8802,
+      "bobsl_val_f1": 0.9656,
+      "bobsl_drop_vs_ep0": 0.0015
+    },
+    {
+      "epoch": 9,
+      "loss": 0.0599,
+      "sh_val_f1": 0.8797,
+      "bobsl_val_f1": 0.9652,
+      "bobsl_drop_vs_ep0": 0.0019
+    },
+    {
+      "epoch": 10,
+      "loss": 0.0576,
+      "sh_val_f1": 0.8783,
+      "bobsl_val_f1": 0.9658,
+      "bobsl_drop_vs_ep0": 0.0013
+    },
+    {
+      "epoch": 11,
+      "loss": 0.0567,
+      "sh_val_f1": 0.8701,
+      "bobsl_val_f1": 0.9654,
+      "bobsl_drop_vs_ep0": 0.0017
+    },
+    {
+      "epoch": 12,
+      "loss": 0.0546,
+      "sh_val_f1": 0.8761,
+      "bobsl_val_f1": 0.965,
+      "bobsl_drop_vs_ep0": 0.0021
+    },
+    {
+      "epoch": 13,
+      "loss": 0.0528,
+      "sh_val_f1": 0.8674,
+      "bobsl_val_f1": 0.965,
+      "bobsl_drop_vs_ep0": 0.0021
+    },
+    {
+      "epoch": 14,
+      "loss": 0.053,
+      "sh_val_f1": 0.8724,
+      "bobsl_val_f1": 0.9648,
+      "bobsl_drop_vs_ep0": 0.0023
+    },
+    {
+      "epoch": 15,
+      "loss": 0.0511,
+      "sh_val_f1": 0.8711,
+      "bobsl_val_f1": 0.9654,
+      "bobsl_drop_vs_ep0": 0.0017
+    }
+  ]
+}
